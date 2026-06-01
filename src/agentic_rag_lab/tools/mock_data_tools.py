@@ -1,4 +1,4 @@
-"""Mock data-processing tools exposed to the Gemini agent."""
+"""Mock data-processing tools exposed to the function-calling agent."""
 
 from __future__ import annotations
 
