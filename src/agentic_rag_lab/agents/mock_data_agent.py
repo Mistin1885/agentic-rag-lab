@@ -4,11 +4,126 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from typing import Any
 
 from agentic_rag_lab.core.logging import AgentLogger, compact_preview
 from agentic_rag_lab.examples_data.mock_orders import RAW_DATASETS
 from agentic_rag_lab.tools.mock_data_tools import TOOL_SPECS, run_tool, validate_answer
+
+
+@dataclass
+class _FuncProxy:
+    name: str
+    arguments: str
+
+
+@dataclass
+class _ToolCallProxy:
+    id: str
+    function: _FuncProxy
+
+
+def _parse_gemma_args(s: str) -> dict[str, Any]:
+    """Parse ``key:val,key:{nested:val}`` with proper brace-depth tracking."""
+    result: dict[str, Any] = {}
+    i, n = 0, len(s)
+    while i < n:
+        while i < n and s[i] in ' \t\n,':
+            i += 1
+        if i >= n:
+            break
+        key_end = i
+        while key_end < n and s[key_end] != ':':
+            key_end += 1
+        key = s[i:key_end].strip()
+        if not key or key_end >= n:
+            break
+        i = key_end + 1
+        while i < n and s[i] in ' \t':
+            i += 1
+        if i >= n:
+            result[key] = None
+            break
+        if s[i] == '{':
+            depth, start = 0, i
+            while i < n:
+                if s[i] == '{':
+                    depth += 1
+                elif s[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+                i += 1
+            result[key] = _parse_gemma_args(s[start + 1:i - 1])
+        else:
+            start, depth = i, 0
+            while i < n:
+                if s[i] == '{':
+                    depth += 1
+                elif s[i] == '}':
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif s[i] == ',' and depth == 0:
+                    break
+                i += 1
+            val = s[start:i].strip()
+            if val.lower() == 'true':
+                result[key] = True
+            elif val.lower() == 'false':
+                result[key] = False
+            else:
+                try:
+                    result[key] = int(val)
+                except ValueError:
+                    try:
+                        result[key] = float(val)
+                    except ValueError:
+                        result[key] = val
+    return result
+
+
+def _parse_text_tool_calls(content: str) -> list[_ToolCallProxy]:
+    """Parse Gemma-style ``call:func{...}`` text with proper nested-brace handling.
+
+    vLLM's pythonic parser expects Python syntax (``func(arg=val)``), but Gemma-4
+    emits ``call:name{key:val,nested:{k:v}}`` including nested dicts.
+    """
+    result: list[_ToolCallProxy] = []
+    i, call_idx = 0, 0
+    while True:
+        start = content.find('call:', i)
+        if start == -1:
+            break
+        name_start = start + 5
+        name_end = name_start
+        while name_end < len(content) and (content[name_end].isalnum() or content[name_end] == '_'):
+            name_end += 1
+        if name_end >= len(content) or content[name_end] != '{':
+            i = name_end
+            continue
+        func_name = content[name_start:name_end]
+        depth, j = 0, name_end
+        while j < len(content):
+            if content[j] == '{':
+                depth += 1
+            elif content[j] == '}':
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            j += 1
+        if depth != 0:
+            i = name_end + 1
+            continue
+        args = _parse_gemma_args(content[name_end + 1:j - 1])
+        result.append(_ToolCallProxy(id=f'text_call_{call_idx}', function=_FuncProxy(name=func_name, arguments=json.dumps(args))))
+        call_idx += 1
+        i = j
+    return result
+
 
 
 SYSTEM_INSTRUCTION = """You are a data-analysis agent demo.
@@ -79,7 +194,18 @@ class VllmDataAgent:
                 temperature=0.2,
             )
             message = response.choices[0].message
-            tool_calls = message.tool_calls or []
+            tool_calls = list(message.tool_calls or [])
+
+            # Fallback: Gemma-4 with --tool-call-parser pythonic emits
+            # "call:func{key:val}" in content instead of structured tool_calls.
+            assistant_content = message.content
+            if not tool_calls and message.content:
+                tool_calls = _parse_text_tool_calls(message.content)
+                if tool_calls:
+                    self.log.event("tool_call_fallback_parsed", step=step, count=len(tool_calls))
+                    # Clear text-form tool calls from assistant content so vLLM
+                    # doesn't see them duplicated alongside the structured tool_calls.
+                    assistant_content = None
 
             if not tool_calls:
                 final_text = message.content or ""
@@ -96,7 +222,7 @@ class VllmDataAgent:
 
             messages.append({
                 "role": "assistant",
-                "content": message.content,
+                "content": assistant_content,
                 "tool_calls": [
                     {
                         "id": tc.id,
