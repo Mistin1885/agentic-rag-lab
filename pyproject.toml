@@ -5,6 +5,8 @@ description = "Learning lab for tool-calling agents, agentic RAG, LangGraph, Ves
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "langchain-openai>=1.2.2",
+  "langgraph>=1.2.2",
   "openai>=1.0.0",
   "python-dotenv>=1.0.1",
 ]
